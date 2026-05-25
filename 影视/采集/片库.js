@@ -245,6 +245,7 @@ async function checkFsSessionActive() {
   if (FS_SESSION_ACTIVE && Date.now() - FS_SESSION_TIME < FS_SESSION_TTL) return true;
   try {
     const cached = await OmniBox.getCache(FS_SESSION_CACHE_KEY);
+    logInfo(`checkFsSession inMemory=${FS_SESSION_ACTIVE} cached=${!!cached}`);
     if (cached) { FS_SESSION_ACTIVE = true; FS_SESSION_TIME = parseInt(cached) || Date.now(); return true; }
   } catch (_) {}
   return false;
@@ -253,6 +254,7 @@ async function checkFsSessionActive() {
 async function markFsSessionActive() {
   FS_SESSION_ACTIVE = true;
   FS_SESSION_TIME = Date.now();
+  logInfo(`markFsSession 写入 TTL=${Math.ceil(FS_SESSION_TTL / 1000)}s`);
   try { await OmniBox.setCache(FS_SESSION_CACHE_KEY, String(FS_SESSION_TIME), Math.ceil(FS_SESSION_TTL / 1000)); } catch (_) {}
 }
 
@@ -631,50 +633,115 @@ async function home(params, context) {
   const $ = cheerio.load(html || "");
   const list = parseVideoList($, baseURL).slice(0, 60);
   logInfo(`home 解析到 ${list.length} 条数据`);
-  return {
-    list,
-    class: filterCategories(CATEGORY_LIST)
-  };
+  const filteredClasses = filterCategories(CATEGORY_LIST);
+  const filters = {};
+  for (const cls of filteredClasses) {
+    const tid = String(cls.type_id);
+    if (FILTERS[tid]) filters[tid] = FILTERS[tid];
+  }
+  return { list, class: filteredClasses, filters };
 }
 
 async function category(params, context) {
   const { categoryId, page } = params;
   const pg = parseInt(page) || 1;
   const baseURL = context?.baseURL || "";
+  const filters = normalizeFilters(params.filters, params.extend, params.ext, params.filter);
+  const tid = String(categoryId || "1");
 
-  if (isCategoryBlocked(categoryId, getCategoryNameById(categoryId))) {
-    logInfo(`分类已屏蔽: ${categoryId}`);
-    return { list: [], page: pg, pagecount: pg };
+  if (isCategoryBlocked(tid, getCategoryNameById(tid))) {
+    logInfo(`分类已屏蔽: ${tid}`);
+    return { list: [], page: pg, pagecount: pg, filters: FILTERS[tid] || [] };
   }
 
-  const url = pg <= 1 ? `${host}/vodtype/${categoryId}.html` : `${host}/vodtype/${categoryId}-${pg}.html`;
+  const url = buildCategoryUrl(tid, pg, filters);
+  logInfo(`category 请求URL: ${url}`);
 
   try {
     const html = await requestHtml(url);
     const $ = cheerio.load(html || "");
     const list = parseVideoList($, baseURL);
-    logInfo(`category tid=${categoryId} pg=${pg} 解析到 ${list.length} 条数据`);
-    return { list, page: pg, pagecount: list.length >= 20 ? pg + 1 : pg };
+    logInfo(`category tid=${tid} pg=${pg} 解析到 ${list.length} 条数据`);
+    return { list, page: pg, pagecount: list.length >= 20 ? pg + 1 : pg, filters: FILTERS[tid] || [] };
   } catch (e) {
     logError("分类获取失败", e);
-    return { list: [], page: pg, pagecount: 0 };
+    return { list: [], page: pg, pagecount: 0, filters: FILTERS[tid] || [] };
   }
 }
 
-function calcVerifyCode(text) {
-  if (!text) return null;
-  let exp = String(text).replace(/\s/g, "").replace(/=/g, "");
-  exp = exp.replace(/[xX×]/g, "*").replace(/－/g, "-").replace(/—/g, "-");
-  const match = exp.match(/^(\d+)([+\-*])(\d+)$/);
-  if (!match) return null;
-  const a = parseInt(match[1], 10);
-  const op = match[2];
-  const b = parseInt(match[3], 10);
-  if (op === "+") return a + b;
-  if (op === "-") return a - b;
-  if (op === "*") return a * b;
-  return null;
+// ==================== 筛选配置 ====================
+function buildFilterOptions(values, allName = "全部") {
+  return [{ name: allName, value: "" }, ...values.filter(Boolean).map(v => ({ name: v, value: v }))];
 }
+
+function buildYearOptions() {
+  const years = [];
+  const currentYear = new Date().getFullYear();
+  for (let y = currentYear; y >= 1990; y--) years.push(String(y));
+  return [{ name: "全部", value: "" }, ...years.map(y => ({ name: `${y}年`, value: y }))];
+}
+
+const MOVIE_CLASSES = ["喜剧", "爱情", "恐怖", "动作", "科幻", "剧情", "战争", "警匪", "犯罪", "古装", "奇幻", "武侠", "冒险", "枪战", "悬疑", "惊悚", "经典", "伦理", "青春", "文艺", "微电影", "动画"];
+const TV_CLASSES = ["喜剧", "爱情", "恐怖", "动作", "科幻", "剧情", "战争", "警匪", "犯罪", "古装", "奇幻", "武侠", "冒险", "悬疑", "惊悚", "家庭", "历史", "都市", "农村", "青春", "偶像", "言情", "穿越", "宫斗", "谍战", "民国", "商战"];
+const DM_CLASSES = ["热血", "格斗", "恋爱", "美少女", "校园", "搞笑", "LOLI", "冒险", "机战", "科幻", "真人", "少女", "魔幻", "运动", "励志", "耽美"];
+const ZY_CLASSES = ["选秀", "情感", "访谈", "播报", "旅游", "音乐", "美食", "纪实", "曲艺", "生活", "游戏", "互动", "财经", "求职"];
+const AREAS = ["大陆", "香港", "台湾", "日本", "韩国", "美国", "泰国", "印度", "英国", "法国", "加拿大", "德国", "意大利", "西班牙", "其他"];
+const SORTS = [
+  { name: "时间", value: "time" },
+  { name: "人气", value: "hits" },
+  { name: "评分", value: "score" },
+];
+
+function buildFilterList({ classes, areas, years, includeClass = true, includeArea = true, includeYear = true, includeSort = true } = {}) {
+  const list = [];
+  if (includeClass && classes && classes.length) list.push({ key: "class", name: "类型", init: "", value: buildFilterOptions(classes) });
+  if (includeArea && areas && areas.length) list.push({ key: "area", name: "地区", init: "", value: buildFilterOptions(areas) });
+  if (includeYear && years) list.push({ key: "year", name: "年份", init: "", value: buildYearOptions() });
+  if (includeSort) list.push({ key: "by", name: "排序", init: "", value: SORTS.map(s => ({ name: s.name, value: s.value })) });
+  return list;
+}
+
+const FILTERS = {
+  "1": buildFilterList({ classes: MOVIE_CLASSES, areas: AREAS, years: true }),
+  "2": buildFilterList({ classes: TV_CLASSES, areas: AREAS, years: true }),
+  "3": buildFilterList({ classes: ZY_CLASSES, areas: AREAS, years: true, includeClass: false }),
+  "4": buildFilterList({ classes: DM_CLASSES, areas: AREAS, years: true }),
+  "30": buildFilterList({ classes: [], areas: AREAS, years: true, includeClass: false }),
+};
+
+function parseFilters(raw) {
+  if (!raw) return {};
+  if (typeof raw === "object") return raw;
+  if (typeof raw === "string") { try { return JSON.parse(raw); } catch { return {}; } }
+  return {};
+}
+
+function normalizeFilters(...sources) {
+  return Object.assign({}, ...sources.map(parseFilters));
+}
+
+function buildCategoryUrl(categoryId, page, filters = {}) {
+  const tid = encodeURIComponent(categoryId || "1");
+  const filtersArr = normalizeFilters(filters);
+  const pg = Math.max(1, parseInt(page) || 1);
+  const area = String(filtersArr.area || "").trim();
+  const by = String(filtersArr.by || filtersArr.sort || "").trim();
+  const cls = String(filtersArr.class || filtersArr.type || "").trim();
+  const year = String(filtersArr.year || "").trim();
+  const hasFilter = area || by || cls || year;
+
+  if (hasFilter) {
+    const qs = [];
+    if (area) qs.push(`area=${encodeURIComponent(area)}`);
+    if (cls) qs.push(`class=${encodeURIComponent(cls)}`);
+    if (year) qs.push(`year=${encodeURIComponent(year)}`);
+    if (by) qs.push(`by=${encodeURIComponent(by)}`);
+    const base = pg <= 1 ? `${host}/vodtype/${tid}.html` : `${host}/vodtype/${tid}-${pg}.html`;
+    return base + (qs.length ? "?" + qs.join("&") : "");
+  }
+  return pg <= 1 ? `${host}/vodtype/${tid}.html` : `${host}/vodtype/${tid}-${pg}.html`;
+}
+// ==================== 筛选配置结束 ====================
 
 function parseSearchResults(html, baseURL, pg, keyword = "") {
   if (!html) return { list: [], page: pg, pagecount: pg, total: 0 };
